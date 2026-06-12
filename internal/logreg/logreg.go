@@ -1,9 +1,11 @@
 package logreg
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"runtime"
 	"sync"
 )
@@ -302,6 +304,60 @@ func (m *Model) Score(X [][]float64, y []float64) float64 {
 		}
 	}
 	return float64(correct) / float64(len(y))
+}
+
+// modelJSON es la forma serializable del modelo: solo lo imprescindible para
+// volver a predecir (los pesos aprendidos y el umbral), no los hiperparámetros
+// de entrenamiento.
+type modelJSON struct {
+	Weights   []float64 `json:"weights"`
+	Bias      float64   `json:"bias"`
+	NFeat     int       `json:"n_features"`
+	Threshold float64   `json:"threshold"`
+}
+
+// Save guarda el modelo entrenado en un archivo JSON, para poder cargarlo más
+// tarde y predecir sin reentrenar.
+func (m *Model) Save(path string) error {
+	if !m.fitted {
+		return fmt.Errorf("logreg: el modelo no está entrenado; llama a Fit antes de Save")
+	}
+	data, err := json.MarshalIndent(modelJSON{
+		Weights:   m.weights,
+		Bias:      m.bias,
+		NFeat:     m.nFeat,
+		Threshold: m.threshold,
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+// Load reconstruye un modelo listo para predecir desde un archivo guardado con
+// Save. No requiere entrenamiento: los pesos quedan cargados directamente.
+func Load(path string) (*Model, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var mj modelJSON
+	if err := json.Unmarshal(data, &mj); err != nil {
+		return nil, fmt.Errorf("logreg: JSON inválido en %q: %w", path, err)
+	}
+	if len(mj.Weights) == 0 {
+		return nil, fmt.Errorf("logreg: el archivo %q no contiene pesos", path)
+	}
+	if mj.Threshold == 0 {
+		mj.Threshold = 0.5
+	}
+	return &Model{
+		weights:   mj.Weights,
+		bias:      mj.Bias,
+		nFeat:     mj.NFeat,
+		threshold: mj.Threshold,
+		fitted:    true,
+	}, nil
 }
 
 // Weights devuelve una copia de los pesos aprendidos.

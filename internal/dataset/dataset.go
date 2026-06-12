@@ -1,8 +1,10 @@
 package dataset
 
 import (
+	"encoding/json"
 	"math"
 	"math/rand"
+	"os"
 )
 
 // TrainTestSplit divide X, y en conjuntos de entrenamiento y prueba.
@@ -99,4 +101,29 @@ func (s *StandardScaler) Transform(X [][]float64) [][]float64 {
 // FitTransform es Fit seguido de Transform.
 func (s *StandardScaler) FitTransform(X [][]float64) [][]float64 {
 	return s.Fit(X).Transform(X)
+}
+
+// Save guarda la media y la desviación aprendidas en un archivo JSON. Hace
+// falta para estandarizar nuevas entradas igual que en el entrenamiento al
+// predecir sin reentrenar.
+func (s *StandardScaler) Save(path string) error {
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+// LoadStandardScaler reconstruye un escalador ya ajustado desde un archivo
+// guardado con Save.
+func LoadStandardScaler(path string) (*StandardScaler, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	s := &StandardScaler{}
+	if err := json.Unmarshal(data, s); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
