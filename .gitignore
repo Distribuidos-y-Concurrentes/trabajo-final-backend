@@ -1,1 +1,25 @@
-.idea
+# IDEs
+.idea/
+.vscode/
+*.swp
+
+# Go build artifacts
+/bin/
+*.exe
+*.test
+*.out
+
+# Archivos de datos generados (el dataset real va por Git LFS)
+crimes_clean.csv
+
+# Modelos y scalers generados por el entrenamiento
+# Descomenta si no quieres trackearlos en el repo:
+# crime_model.json
+# crime_scaler.json
+
+# Variables de entorno
+.env
+.env.local
+
+# Docker
+docker-compose.override.yml
