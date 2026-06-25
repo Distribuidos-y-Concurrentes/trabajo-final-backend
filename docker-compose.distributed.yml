@@ -1,0 +1,46 @@
+# Entrenamiento distribuido del modelo (parameter server síncrono).
+#
+# Levantar con N nodos (WORLD_SIZE debe coincidir con --scale node):
+#   docker compose -f docker-compose.distributed.yml up --build --scale node=4
+#
+# El coordinador espera a que se registren WORLD_SIZE nodos, reparte el dataset,
+# entrena y escribe el modelo en ./crime_model_distributed.json (volumen ./:/out).
+services:
+  coordinator:
+    build:
+      context: .
+      dockerfile: cmd/coordinator/Dockerfile
+    environment:
+      LISTEN_ADDR: ":9100"
+      WORLD_SIZE: "4" # <-- debe coincidir con --scale node=N
+      DATA_PATH: "/data/crimes_clean.csv"
+      MODEL_OUT: "/out/crime_model_distributed.json"
+      EPOCHS: "300"
+      LR: "0.5"
+      L2: "0.001"
+    volumes:
+      - ./cmd/cleaning/crimes_clean.csv:/data/crimes_clean.csv:ro
+      - ./:/out # el modelo entrenado aparece en la raíz del repo
+    ports:
+      - "9100:9100" # opcional, para inspección desde el host
+    networks: [cluster]
+
+  node:
+    build:
+      context: .
+      dockerfile: cmd/node/Dockerfile
+    environment:
+      COORDINATOR_ADDR: "coordinator:9100"
+      DATA_PATH: "/data/crimes_clean.csv"
+      SCALER_PATH: "/data/crime_scaler.json"
+      # WORKERS: "4"   # por defecto = núcleos del contenedor
+    volumes:
+      - ./cmd/cleaning/crimes_clean.csv:/data/crimes_clean.csv:ro
+      - ./crime_scaler.json:/data/crime_scaler.json:ro
+    depends_on:
+      - coordinator
+    networks: [cluster]
+
+networks:
+  cluster:
+    driver: bridge

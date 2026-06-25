@@ -1,0 +1,9 @@
+# Evita copiar gigas innecesarios al build context de Docker. Los CSV y artefactos
+# se inyectan en runtime como VOLÚMENES (ver docker-compose.distributed.yml), no en
+# la imagen.
+cmd/cleaning/*.csv
+*.pdf
+*.json
+.git
+.DS_Store
+**/.DS_Store

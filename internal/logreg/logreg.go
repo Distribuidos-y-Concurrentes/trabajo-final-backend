@@ -273,6 +273,97 @@ func (m *Model) update(gradW []float64, gradB float64) {
 	m.bias -= m.lr * gradB
 }
 
+// SetParams carga pesos y bias en el modelo y lo marca como entrenado. nFeat se
+// infiere de la longitud de weights. Pensado para el ENTRENAMIENTO DISTRIBUIDO: el
+// coordinador difunde los pesos globales en cada ronda y el nodo los inyecta aquí
+// antes de calcular su gradiente parcial; al terminar, el coordinador usa SetParams
+// + Save para persistir el modelo final.
+func (m *Model) SetParams(weights []float64, bias float64) {
+	m.weights = append([]float64(nil), weights...) // copia defensiva
+	m.bias = bias
+	m.nFeat = len(weights)
+	m.fitted = true
+}
+
+// GradSums calcula EN PARALELO (con m.nWorkers goroutines) las SUMAS —sin promediar
+// y sin regularización— del gradiente y de la pérdida sobre todo (X,y), usando los
+// pesos actuales del modelo. Devuelve también count = nº de muestras.
+//
+// Es la pieza que habilita el descenso de gradiente DISTRIBUIDO: cada nodo del
+// clúster llama a GradSums sobre su shard local y envía (sumW, sumB, sumLoss, count)
+// al coordinador, que promedia globalmente (Σsum / Σcount), añade el L2 sobre los
+// pesos globales y actualiza. Devolver sumas crudas (no promedios) es lo que permite
+// recombinar shards de distinto tamaño sin sesgo.
+//
+// Reusa el mismo patrón sin condiciones de carrera que gradient(): cada goroutine
+// acumula en buffers locales y el hilo principal reduce.
+func (m *Model) GradSums(X [][]float64, y []float64) (sumW []float64, sumB, sumLoss float64, count int) {
+	n := len(X)
+	sumW = make([]float64, m.nFeat)
+	if n == 0 {
+		return sumW, 0, 0, 0
+	}
+
+	workers := m.nWorkers
+	if workers > n {
+		workers = n
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	// Cada worker escribe en results[id]: posiciones distintas => sin races.
+	results := make([]partial, workers)
+	chunk := (n + workers - 1) / workers
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		start := w * chunk
+		end := start + chunk
+		if end > n {
+			end = n
+		}
+		if start >= end {
+			continue
+		}
+
+		wg.Add(1)
+		go func(id, s, e int) {
+			defer wg.Done()
+
+			// Buffers LOCALES del worker (no compartidos).
+			lg := make([]float64, m.nFeat)
+			var lb, ll float64
+
+			for i := s; i < e; i++ {
+				xi := X[i]
+				p := sigmoid(m.dot(xi) + m.bias)
+				errTerm := p - y[i]
+				for j, xj := range xi {
+					lg[j] += errTerm * xj
+				}
+				lb += errTerm
+				ll += crossEntropy(y[i], p)
+			}
+			results[id] = partial{gradW: lg, gradB: lb, loss: ll}
+		}(w, start, end)
+	}
+	wg.Wait()
+
+	// Reducción: el hilo principal suma los parciales (sin promediar).
+	for _, r := range results {
+		if r.gradW == nil { // chunk vacío
+			continue
+		}
+		for j := range sumW {
+			sumW[j] += r.gradW[j]
+		}
+		sumB += r.gradB
+		sumLoss += r.loss
+	}
+	return sumW, sumB, sumLoss, n
+}
+
 // PredictProba devuelve la probabilidad P(y=1|x) para cada fila de X.
 func (m *Model) PredictProba(X [][]float64) []float64 {
 	out := make([]float64, len(X))
