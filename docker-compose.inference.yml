@@ -62,9 +62,23 @@ services:
         condition: service_healthy
     networks: [serving]
 
-  # Nota: NO hay servicio 'balancer'. El balanceo vive en el paquete
-  # internal/balancer, embebido en la API (bal := balancer.New(rdb)). La API será
-  # otro servicio de este compose y se conectará a redis + a los nodos de inferencia.
+  # La API HTTP embebe el balanceador (internal/balancer). Descubre los nodos de
+  # inferencia leyendo Redis y les reenvía las peticiones por TCP directamente.
+  api:
+    build:
+      context: .
+      dockerfile: cmd/api/Dockerfile
+    environment:
+      LISTEN_ADDR: ":8080"
+      REDIS_ADDR: "redis:6379"
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      inference:
+        condition: service_started
+    networks: [serving]
 
 volumes:
   redis_data:
