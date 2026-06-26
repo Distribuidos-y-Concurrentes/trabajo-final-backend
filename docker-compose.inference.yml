@@ -1,0 +1,75 @@
+# Stack de SERVING / inferencia: capa de datos (Redis + MongoDB) + nodos de
+# inferencia. El balanceador se añadirá en el siguiente paso.
+#
+# Levantar todo con N nodos de inferencia:
+#   docker compose -f docker-compose.inference.yml up --build --scale inference=3
+#
+# Solo la capa de datos (Redis + Mongo):
+#   docker compose -f docker-compose.inference.yml up -d redis mongo
+services:
+  # --- Cache / descubrimiento de nodos (direcciones + carga) ---
+  redis:
+    image: redis:alpine
+    command: ["redis-server", "--appendonly", "yes"] # persistencia AOF
+    ports:
+      - "6379:6379" # opcional, para inspección desde el host
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [serving]
+
+  # --- Almacenamiento persistente (histórico de predicciones, resultados) ---
+  mongo:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: example
+      MONGO_INITDB_DATABASE: crimes
+    ports:
+      - "27017:27017" # opcional, para conectarse con Compass/mongosh
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [serving]
+
+  # --- Nodos de inferencia (escalan con --scale inference=N) ---
+  inference:
+    build:
+      context: .
+      dockerfile: cmd/inference/Dockerfile
+    environment:
+      LISTEN_ADDR: ":9200"
+      # Tras entrenar, apunta al modelo distribuido: /data/crime_model_distributed.json
+      MODEL_PATH: "/data/crime_model.json"
+      SCALER_PATH: "/data/crime_scaler.json"
+      REDIS_ADDR: "redis:6379"
+      HEARTBEAT_TTL: "10"
+      # ADVERTISE_ADDR se deja vacío: por defecto = hostname (ID del contenedor):9200,
+      # alcanzable por el balanceador dentro de la red 'serving'.
+    volumes:
+      - ./crime_model.json:/data/crime_model.json:ro
+      - ./crime_scaler.json:/data/crime_scaler.json:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks: [serving]
+
+  # Nota: NO hay servicio 'balancer'. El balanceo vive en el paquete
+  # internal/balancer, embebido en la API (bal := balancer.New(rdb)). La API será
+  # otro servicio de este compose y se conectará a redis + a los nodos de inferencia.
+
+volumes:
+  redis_data:
+  mongo_data:
+
+networks:
+  serving:
+    driver: bridge
