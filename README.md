@@ -44,11 +44,11 @@ El sistema se divide en cuatro partes desplegadas con Docker Compose:
 | Parte | Descripcion | Estado |
 |-------|-------------|--------|
 | A — Cargador concurrente | Lee el CSV en chunks paralelos, valida, deduplica y genera `crimes_clean.csv` | Completo |
-| B — Entrenamiento distribuido | Cluster de 3 nodos Go que computan gradientes por TCP | En desarrollo |
-| C — API coordinadora | Servidor REST + WebSocket con latencia < 100ms | Pendiente |
+| B — Entrenamiento distribuido | Parameter server TCP: coordinator + N nodos de computo de gradientes | Completo |
+| C — Inferencia + API HTTP | Cluster de nodos de inferencia con balanceo least-connections y API REST | Completo |
 | D — Visualizacion | Frontend React con mapas de calor y metricas del cluster | Pendiente |
 
-Infraestructura planificada: MongoDB (persistencia historica), Redis (cache de predicciones).
+Infraestructura: Redis (descubrimiento de nodos y balanceo de carga), MongoDB (persistencia historica de predicciones).
 
 ---
 
@@ -57,21 +57,31 @@ Infraestructura planificada: MongoDB (persistencia historica), Redis (cache de p
 ```
 trabajo-final-backend/
 ├── cmd/
-│   ├── api/              # Punto de entrada de la API coordinadora
+│   ├── api/              # API HTTP REST (predict / health / metrics)
 │   ├── cleaning/         # Cargador y limpiador concurrente del dataset
+│   ├── coordinator/      # Coordinador del entrenamiento distribuido (parameter server)
+│   ├── inference/        # Nodo de inferencia TCP con heartbeat a Redis
+│   ├── node/             # Nodo de computo de gradientes (entrenamiento distribuido)
 │   └── train_crimes/     # CLI de entrenamiento local con metricas
 ├── internal/
+│   ├── balancer/         # Balanceador least-connections sobre Redis
+│   ├── crimedata/        # Columnas del dataset y lectura de CSV
 │   ├── dataset/          # TrainTestSplit y StandardScaler
+│   ├── distrib/          # Protocolo TCP (entrenamiento e inferencia)
 │   ├── logreg/           # Regresion logistica con gradiente paralelo
-│   └── metrics/          # Accuracy, Precision, Recall, F1, matriz de confusion
-├── crime_model.json      # Pesos del modelo serializado
+│   ├── metrics/          # Accuracy, Precision, Recall, F1, matriz de confusion
+│   └── registry/         # Registro de nodos de inferencia en Redis (TTL)
+├── docker-compose.distributed.yml   # Stack de entrenamiento distribuido
+├── docker-compose.inference.yml     # Stack de inferencia: Redis + MongoDB + nodos + API
+├── crime_model.json      # Pesos del modelo serializado (entrenamiento local)
+├── crime_model_distributed.json     # Pesos del modelo serializado (entrenamiento distribuido)
 ├── crime_scaler.json     # Parametros del StandardScaler serializado
 └── go.mod
 ```
 
 ---
 
-## Entregable 1 — Estado actual
+## Entregable 1 — Limpieza y modelo local
 
 ### Limpieza concurrente (Parte A)
 
@@ -87,7 +97,7 @@ Resultados sobre el dataset completo con 4 workers:
 
 Filtros aplicados: coordenadas fuera del rango de Chicago, distritos fuera del rango 1-31, duplicados por ID, fechas mal formateadas, filas incompletas.
 
-### Modelo de ML (Parte B — local)
+### Modelo de ML (local)
 
 Regresion logistica binaria con gradiente descendente paralelizado. El metodo `gradient` reparte el batch entre goroutines con buffers locales independientes y sin locks; se sincroniza con `sync.WaitGroup` al final de cada epoca.
 
@@ -105,11 +115,89 @@ Metricas en test (split 80/20, seed=42):
 
 ---
 
-## Ejecucion
+## Entregable 2 — Entrenamiento distribuido y serving
+
+### Entrenamiento distribuido (Parte B)
+
+Parameter server sincrono sobre TCP. El coordinator espera a que se registren `WORLD_SIZE` nodos, les reparte el dataset en shards y por cada epoca:
+
+1. Difunde los pesos globales a todos los nodos en paralelo.
+2. Cada nodo calcula las sumas del gradiente sobre su shard local (con goroutines internas).
+3. El coordinator recolecta las sumas de todos los nodos (barrera de sincronizacion), promedia globalmente `Σsum / Σcount`, aplica regularizacion L2 y actualiza los pesos.
+
+Los datos nunca salen del nodo: por la red solo viajan pesos y gradientes.
+
+```bash
+# Levantar coordinator + 4 nodos de computo
+docker compose -f docker-compose.distributed.yml up --build
+```
+
+El modelo resultante se guarda en `crime_model_distributed.json`.
+
+### Cluster de inferencia (Parte C)
+
+Cada nodo de inferencia (`cmd/inference`) carga el modelo y el scaler, atiende predicciones por TCP y se autorregistra en Redis con un TTL. Si el nodo muere, su clave expira y el balanceador deja de verlo automaticamente.
+
+El balanceador (`internal/balancer`) vive embebido en la API: consulta Redis para obtener los nodos vivos, desempata con shuffle y elige el de menor carga efectiva (carga publicada en Redis + peticiones en vuelo locales).
+
+### API HTTP (Parte C)
+
+Servidor REST en `:8080` que actua como punto de entrada unico al cluster.
+
+| Endpoint | Descripcion |
+|----------|-------------|
+| `POST /predict` | Recibe features en JSON, reenvía al nodo con menor carga, devuelve la prediccion |
+| `GET /health` | Liveness probe |
+| `GET /metrics` | Contadores de requests/errores y estado actual de cada nodo (carga en vuelo) |
+
+**Ejemplo de prediccion:**
+
+```bash
+curl -X POST http://localhost:8080/predict \
+  -H "Content-Type: application/json" \
+  -d '{"features":{"district":3,"hour":22,"is_night":1,"day_of_week":5,"weekday":5,"month":6,"grid_lat":41.85,"grid_lon":-87.65,"location_encoded":2,"domestic":0}}'
+```
+
+```json
+{
+  "prob": 0.7821,
+  "is_high_risk": true,
+  "node": "abc123def456:9200"
+}
+```
+
+**Metricas del cluster:**
+
+```bash
+curl http://localhost:8080/metrics
+```
+
+```json
+{
+  "requests_total": 142,
+  "errors_total": 3,
+  "nodes": [
+    { "addr": "abc123:9200", "load": 2 },
+    { "addr": "def456:9200", "load": 0 }
+  ],
+  "nodes_error": ""
+}
+```
+
+**Levantar el stack completo de inferencia:**
+
+```bash
+# Redis + MongoDB + 3 nodos de inferencia + API
+docker compose -f docker-compose.inference.yml up --build --scale inference=3
+```
+
+---
+
+## Ejecucion local (sin Docker)
 
 ### Requisitos
 
-- Go 1.21 o superior
+- Go 1.22 o superior
 - `crimes.csv` del Chicago Data Portal ubicado en `cmd/cleaning/`
 
 ### Limpieza del dataset
@@ -121,7 +209,7 @@ go run limpieza.go
 
 Genera `crimes_clean.csv` en el mismo directorio.
 
-### Entrenamiento
+### Entrenamiento local
 
 ```bash
 go run cmd/train_crimes/main.go
